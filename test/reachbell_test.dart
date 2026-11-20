@@ -1,0 +1,323 @@
+import 'dart:convert';
+
+import 'package:flutter_test/flutter_test.dart';
+import 'package:http/http.dart' as http;
+import 'package:http/testing.dart';
+import 'package:reachbell/reachbell.dart';
+
+class FakeTokenSource implements TokenSource {
+  FakeTokenSource({this.granted = true, this.token = 'fcm-token-1'});
+
+  final bool granted;
+  final String? token;
+  PushPlatform? requestedFor;
+
+  @override
+  Future<bool> requestPermission() async => granted;
+
+  @override
+  Future<String?> getToken(PushPlatform platform) async {
+    requestedFor = platform;
+    return token;
+  }
+}
+
+class Recorded {
+  Recorded(this.request, this.body);
+
+  final http.Request request;
+  final Map<String, dynamic> body;
+}
+
+MockClient mockClient(
+  List<Recorded> calls,
+  http.Response Function(http.Request request) handler,
+) {
+  return MockClient((request) async {
+    calls.add(
+        Recorded(request, jsonDecode(request.body) as Map<String, dynamic>));
+    return handler(request);
+  });
+}
+
+http.Response json(Object body, [int status = 200]) => http.Response(
+      jsonEncode(body),
+      status,
+      headers: {'content-type': 'application/json'},
+    );
+
+void setUpSdk({
+  required http.Client client,
+  TokenSource? tokenSource,
+  PushPlatform platform = PushPlatform.android,
+  String? apiUrl,
+}) {
+  ReachBell.debugOverride(
+    httpClient: client,
+    tokenSource: tokenSource ?? FakeTokenSource(),
+    platform: platform,
+  );
+  ReachBell.init(apiKey: 'rb_live_test', apiUrl: apiUrl);
+}
+
+Matcher throwsReachBell({int? statusCode, String? message}) {
+  var matcher = isA<ReachBellException>();
+  if (statusCode != null) {
+    matcher = matcher.having((e) => e.statusCode, 'statusCode', statusCode);
+  }
+  if (message != null) {
+    matcher = matcher.having((e) => e.message, 'message', contains(message));
+  }
+  return throwsA(matcher);
+}
+
+void main() {
+  late List<Recorded> calls;
+
+  setUp(() {
+    calls = [];
+    ReachBell.debugReset();
+  });
+
+  tearDown(ReachBell.debugReset);
+
+  group('init', () {
+    test('rejects empty apiKey', () {
+      expect(() => ReachBell.init(apiKey: '  '), throwsReachBell());
+    });
+
+    test('methods throw before init', () async {
+      expect(ReachBell.register(), throwsReachBell(message: 'init()'));
+      expect(ReachBell.identify('u'), throwsReachBell(message: 'init()'));
+      expect(ReachBell.tag(['a']), throwsReachBell(message: 'init()'));
+    });
+  });
+
+  group('register', () {
+    test('posts token with fcm tokenType on android', () async {
+      setUpSdk(
+        client: mockClient(calls, (_) => json({'_id': 'sub_1'}, 201)),
+      );
+
+      final result = await ReachBell.register(externalId: 'user_42');
+
+      expect(result.token, 'fcm-token-1');
+      expect(result.tokenType, TokenType.fcm);
+      expect(result.platform, PushPlatform.android);
+      expect(result.subscriberId, 'sub_1');
+      expect(ReachBell.token, 'fcm-token-1');
+
+      expect(calls, hasLength(1));
+      final call = calls.single;
+      expect(call.request.method, 'POST');
+      expect(
+          call.request.url.toString(), 'https://api.reachbell.com/subscribers');
+      expect(call.request.headers['x-api-key'], 'rb_live_test');
+      expect(call.body, {
+        'token': 'fcm-token-1',
+        'tokenType': 'fcm',
+        'platform': 'android',
+        'externalId': 'user_42',
+      });
+    });
+
+    test('uses fcm tokenType and ios platform on iOS', () async {
+      final source = FakeTokenSource();
+      setUpSdk(
+        client: mockClient(calls, (_) => json({'_id': 'sub_2'})),
+        tokenSource: source,
+        platform: PushPlatform.ios,
+        apiUrl: 'https://staging.example.com/',
+      );
+
+      final result = await ReachBell.register();
+
+      expect(result.tokenType, TokenType.fcm);
+      expect(result.platform, PushPlatform.ios);
+      expect(source.requestedFor, PushPlatform.ios);
+      expect(calls.single.request.url.toString(),
+          'https://staging.example.com/subscribers');
+      expect(calls.single.body['tokenType'], 'fcm');
+      expect(calls.single.body['platform'], 'ios');
+      expect(calls.single.body.containsKey('externalId'), isFalse);
+    });
+
+    test('throws when permission is denied', () async {
+      setUpSdk(
+        client: mockClient(calls, (_) => json({})),
+        tokenSource: FakeTokenSource(granted: false),
+      );
+
+      await expectLater(
+          ReachBell.register(), throwsReachBell(message: 'permission denied'));
+      expect(calls, isEmpty);
+      expect(ReachBell.token, isNull);
+    });
+
+    test('throws when no token is available', () async {
+      setUpSdk(
+        client: mockClient(calls, (_) => json({})),
+        tokenSource: FakeTokenSource(token: null),
+      );
+
+      await expectLater(
+          ReachBell.register(), throwsReachBell(message: 'No push token'));
+      expect(calls, isEmpty);
+    });
+
+    test('maps non-2xx responses with statusCode and body', () async {
+      setUpSdk(
+        client: mockClient(
+            calls, (_) => json({'message': 'Subscriber limit reached'}, 403)),
+      );
+
+      await expectLater(
+        ReachBell.register(),
+        throwsA(isA<ReachBellException>()
+            .having((e) => e.statusCode, 'statusCode', 403)
+            .having((e) => e.message, 'message', 'Subscriber limit reached')
+            .having((e) => e.body, 'body',
+                {'message': 'Subscriber limit reached'})),
+      );
+      expect(ReachBell.token, isNull);
+    });
+
+    test('keeps non-json error bodies as text', () async {
+      setUpSdk(
+        client: mockClient(calls, (_) => http.Response('Bad Gateway', 502)),
+      );
+
+      await expectLater(
+        ReachBell.register(),
+        throwsA(isA<ReachBellException>()
+            .having((e) => e.statusCode, 'statusCode', 502)
+            .having((e) => e.body, 'body', 'Bad Gateway')),
+      );
+    });
+
+    test('maps network errors with null statusCode', () async {
+      ReachBell.debugOverride(
+        httpClient: MockClient(
+            (_) async => throw http.ClientException('connection refused')),
+        tokenSource: FakeTokenSource(),
+        platform: PushPlatform.android,
+      );
+      ReachBell.init(apiKey: 'rb_live_test');
+
+      await expectLater(
+        ReachBell.register(),
+        throwsA(isA<ReachBellException>()
+            .having((e) => e.statusCode, 'statusCode', isNull)
+            .having((e) => e.message, 'message', contains('Network error'))),
+      );
+    });
+
+    test('maps timeouts with null statusCode', () async {
+      ReachBell.debugOverride(
+        httpClient: MockClient((_) async {
+          await Future<void>.delayed(const Duration(milliseconds: 200));
+          return json({});
+        }),
+        tokenSource: FakeTokenSource(),
+        platform: PushPlatform.android,
+      );
+      ReachBell.init(
+          apiKey: 'rb_live_test', timeout: const Duration(milliseconds: 20));
+
+      await expectLater(
+        ReachBell.register(),
+        throwsA(isA<ReachBellException>()
+            .having((e) => e.statusCode, 'statusCode', isNull)
+            .having((e) => e.message, 'message', contains('timed out'))),
+      );
+    });
+  });
+
+  group('identify, tag, untag', () {
+    test('throw before register', () async {
+      setUpSdk(client: mockClient(calls, (_) => json({'success': true})));
+
+      await expectLater(ReachBell.identify('user_42'),
+          throwsReachBell(message: 'register()'));
+      await expectLater(
+          ReachBell.tag(['pro']), throwsReachBell(message: 'register()'));
+      await expectLater(
+          ReachBell.untag(['pro']), throwsReachBell(message: 'register()'));
+      expect(calls, isEmpty);
+    });
+
+    test('send token after register', () async {
+      setUpSdk(
+        client: mockClient(calls, (request) {
+          if (request.url.path == '/subscribers') return json({'_id': 's'});
+          return json({'success': true, 'updated': true});
+        }),
+      );
+
+      await ReachBell.register();
+      await ReachBell.identify('user_42');
+      await ReachBell.tag(['pro', ' beta ', 'pro']);
+      await ReachBell.untag(['beta']);
+
+      expect(calls.map((c) => c.request.url.path).toList(), [
+        '/subscribers',
+        '/subscribers/identify',
+        '/subscribers/tag',
+        '/subscribers/untag',
+      ]);
+      expect(calls[1].body, {'token': 'fcm-token-1', 'externalId': 'user_42'});
+      expect(calls[2].body, {
+        'token': 'fcm-token-1',
+        'tags': ['pro', 'beta'],
+      });
+      expect(calls[3].body, {
+        'token': 'fcm-token-1',
+        'tags': ['beta'],
+      });
+    });
+
+    test('map success:false to ReachBellException', () async {
+      setUpSdk(
+        client: mockClient(calls, (request) {
+          if (request.url.path == '/subscribers') return json({'_id': 's'});
+          return json({
+            'success': false,
+            'updated': false,
+            'reason': 'subscriber_not_found',
+          });
+        }),
+      );
+
+      await ReachBell.register();
+
+      for (final action in [
+        () => ReachBell.identify('user_42'),
+        () => ReachBell.tag(['pro']),
+        () => ReachBell.untag(['pro']),
+      ]) {
+        await expectLater(
+          action(),
+          throwsA(isA<ReachBellException>()
+              .having((e) => e.message, 'message', 'subscriber_not_found')
+              .having((e) => e.statusCode, 'statusCode', 200)
+              .having((e) => e.body, 'body', isA<Map<String, dynamic>>())),
+        );
+      }
+    });
+
+    test('reject empty arguments without calling the API', () async {
+      setUpSdk(
+        client: mockClient(calls, (request) {
+          if (request.url.path == '/subscribers') return json({'_id': 's'});
+          return json({'success': true});
+        }),
+      );
+      await ReachBell.register();
+      calls.clear();
+
+      await expectLater(ReachBell.identify(' '), throwsReachBell());
+      await expectLater(ReachBell.tag(['', ' ']), throwsReachBell());
+      expect(calls, isEmpty);
+    });
+  });
+}
