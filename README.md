@@ -65,7 +65,17 @@ try {
 
 `RegisterResult` has `token`, `tokenType` (`TokenType.fcm` on both Android and iOS, since the token comes from Firebase Cloud Messaging), `platform` (`PushPlatform.android` or `PushPlatform.ios`) and `subscriberId`.
 
-The token is kept in memory only. Registration is idempotent on the server, so call `register()` on every launch, and again from `FirebaseMessaging.instance.onTokenRefresh` when the token rotates.
+The token is kept in memory only. Registration is idempotent on the server, so call `register()` on every launch, and again from `FirebaseMessaging.instance.onTokenRefresh` when the token rotates. The SDK does not remember the external id, and a rotated token is a new subscriber on the server, so pass the signed-in user's id again or the new subscription is not linked to them:
+
+```dart
+FirebaseMessaging.instance.onTokenRefresh.listen((_) async {
+  try {
+    await ReachBell.register(externalId: currentUserId);
+  } on ReachBellException catch (e) {
+    debugPrint('ReachBell re-register failed: ${e.message}');
+  }
+});
+```
 
 ## Errors
 
