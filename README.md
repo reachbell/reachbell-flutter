@@ -9,8 +9,11 @@ Sending pushes and building campaigns happen server-side with the ReachBell serv
 ```yaml
 dependencies:
   firebase_core: ^3.0.0
+  firebase_messaging: ^15.0.0
   reachbell: ^1.0.0
 ```
+
+`reachbell` already depends on `firebase_messaging`; list it yourself as well when your code imports it, for example to listen to `onTokenRefresh` as shown below.
 
 ```bash
 flutter pub get
@@ -57,19 +60,48 @@ try {
 | Member | Description |
 | --- | --- |
 | `ReachBell.init({required String apiKey, String? apiUrl, Duration timeout})` | Configure the SDK once. `apiUrl` defaults to `https://api.reachbell.com`, `timeout` to 15 seconds. |
-| `ReachBell.register({String? externalId})` | Requests notification permission, reads the FCM token and registers the device. Returns a `RegisterResult`. |
+| `ReachBell.register({String? externalId, String? previousToken})` | Requests notification permission (skipped when already granted), reads the FCM token and registers the device. Calls run one at a time. When the token differs from the last registered one, `previousToken` defaults to that token. Returns a `RegisterResult`. |
 | `ReachBell.identify(String externalId)` | Links the registered device to your user id. |
 | `ReachBell.tag(List<String> tags)` | Adds tags to the registered subscriber. |
 | `ReachBell.untag(List<String> tags)` | Removes tags from the registered subscriber. |
+| `ReachBell.reset()` | Call on logout. Calls `POST /subscribers/unidentify` for the registered token (best effort, errors are ignored), then forgets the token. Waits for a `register()` in progress. |
 | `ReachBell.token` | Token from the last successful `register()` in this process, or `null`. |
 
 `RegisterResult` has `token`, `tokenType` (`TokenType.fcm` on both Android and iOS, since the token comes from Firebase Cloud Messaging), `platform` (`PushPlatform.android` or `PushPlatform.ios`) and `subscriberId`.
 
-The token is kept in memory only. Registration is idempotent on the server, so call `register()` on every launch, and again from `FirebaseMessaging.instance.onTokenRefresh` when the token rotates.
+The token is kept in memory only. Registration is idempotent on the server, so call `register()` on every launch, and again from `FirebaseMessaging.instance.onTokenRefresh` when the token rotates. On a rotation, `register()` sends the previous token as `previousToken`, and ReachBell moves the old subscriber's tags and external id to the new token and deactivates the old one. You do not need to pass the external id again or re-apply tags:
+
+```dart
+import 'package:firebase_messaging/firebase_messaging.dart';
+import 'package:flutter/foundation.dart';
+import 'package:reachbell/reachbell.dart';
+
+void listenForTokenRefresh() {
+  FirebaseMessaging.instance.onTokenRefresh.listen((_) async {
+    try {
+      await ReachBell.register();
+    } on ReachBellException catch (e) {
+      debugPrint('ReachBell re-register failed: ${e.message}');
+    }
+  });
+}
+```
+
+Because the token lives in memory, a token that rotated while the app was not running is registered as a new subscriber on the next launch. If you persist `ReachBell.token` yourself, pass it back as `register(previousToken: savedToken)` to carry tags and the external id over in that case too. Delete that saved token when you call `ReachBell.reset()`: passed back after a logout, it would carry the old user's tags and external id over to the next registration.
+
+When the user logs out, call `ReachBell.reset()` so the device is no longer linked to their user id. The device stays subscribed anonymously; call `register(externalId: ...)` or `identify(...)` for the next user. The first `register()` after `reset()` without an `externalId` sends `"externalId": null`, so the server drops the old user even if the unidentify call failed offline. All SDK calls run one at a time in call order, so `reset()` followed by `register()` or `identify()` without `await` is safe.
+
+```dart
+Future<void> logout() async {
+  await ReachBell.reset();
+  // If you persist ReachBell.token, delete the saved copy here.
+  // ...your own sign-out
+}
+```
 
 ## Errors
 
-Every method throws `ReachBellException` with `message`, `statusCode` and `body`:
+Every method except `reset()` throws `ReachBellException` with `message`, `statusCode` and `body`:
 
 - `init()` not called, or `identify()` / `tag()` / `untag()` called before a successful `register()`.
 - Notification permission denied, or no push token available.

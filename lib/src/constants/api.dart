@@ -4,6 +4,7 @@ const String apiKeyHeader = 'x-api-key';
 
 const String subscribersPath = '/subscribers';
 const String identifyPath = '/subscribers/identify';
+const String unidentifyPath = '/subscribers/unidentify';
 const String tagPath = '/subscribers/tag';
 const String untagPath = '/subscribers/untag';
 

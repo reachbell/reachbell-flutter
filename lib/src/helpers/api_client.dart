@@ -8,15 +8,36 @@ import '../types/config.dart';
 import '../types/reachbell_exception.dart';
 
 class ApiClient {
-  ApiClient(this._config, this._client);
+  ApiClient(this._config, this._client, {bool ownsClient = false})
+      : _ownsClient = ownsClient;
 
   final ReachBellConfig _config;
   final http.Client _client;
+  final bool _ownsClient;
+
+  int _inFlight = 0;
+  bool _closeWhenIdle = false;
+  bool _closed = false;
+
+  /// Closes the owned http.Client once every request already started on it
+  /// has finished, so a re-`init()` does not fail them with
+  /// "Client is already closed". A client passed in from outside is left open.
+  void closeWhenIdle() {
+    _closeWhenIdle = true;
+    _maybeClose();
+  }
+
+  void _maybeClose() {
+    if (!_ownsClient || _closed || !_closeWhenIdle || _inFlight > 0) return;
+    _closed = true;
+    _client.close();
+  }
 
   Future<({int statusCode, Object? body})> post(
       String path, Map<String, Object?> body) async {
     final uri = Uri.parse('${_config.apiUrl}$path');
     final http.Response response;
+    _inFlight++;
     try {
       response = await _client
           .post(
@@ -32,8 +53,14 @@ class ApiClient {
     } on TimeoutException {
       throw ReachBellException(
           'Request to $path timed out after ${_config.timeout.inMilliseconds}ms');
-    } on Exception catch (error) {
+    } catch (error) {
+      // Not only Exceptions: an http.Client can also surface Errors
+      // (ArgumentError, StateError, TypeError) that callers should see as
+      // ReachBellException like every other failure.
       throw ReachBellException('Network error calling $path: $error');
+    } finally {
+      _inFlight--;
+      _maybeClose();
     }
 
     final decoded = _decode(response.body);
@@ -77,6 +104,14 @@ class ApiClient {
       for (final key in const ['message', 'error', 'reason']) {
         final value = decoded[key];
         if (value is String && value.isNotEmpty) return value;
+        // NestJS validation errors send `message` as a list of strings.
+        if (value is List) {
+          final parts = value
+              .map((item) => item?.toString() ?? '')
+              .where((item) => item.isNotEmpty)
+              .toList();
+          if (parts.isNotEmpty) return parts.join('; ');
+        }
       }
     }
     return null;

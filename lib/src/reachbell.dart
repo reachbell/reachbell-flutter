@@ -9,6 +9,7 @@ import 'types/push_platform.dart';
 import 'types/reachbell_exception.dart';
 import 'types/register_result.dart';
 import 'types/token_type.dart';
+import 'utils/device_info.dart';
 import 'utils/platform.dart';
 import 'utils/url.dart';
 
@@ -17,12 +18,22 @@ class ReachBell {
 
   static ReachBellConfig? _config;
   static ApiClient? _api;
-  static http.Client? _ownedClient;
   static String? _token;
+
+  /// Set by reset(): the next register() without an externalId sends
+  /// `"externalId": null` so the server drops the old user even when the
+  /// best-effort unidentify failed (offline). Cleared after a successful
+  /// register(). Kept in memory, like the token.
+  static bool _clearExternalIdPending = false;
+
+  /// Tail of the queue that runs every API call (register, reset, identify,
+  /// tag, untag) one at a time, in call order.
+  static Future<void> _queue = Future<void>.value();
 
   static http.Client? _testClient;
   static TokenSource? _testTokenSource;
   static PushPlatform? _testPlatform;
+  static DeviceInfo? _testDeviceInfo;
 
   static String? get token => _token;
 
@@ -46,14 +57,38 @@ class ReachBell {
       throw ReachBellException('ReachBell.init: invalid apiUrl "$apiUrl"');
     }
     final config = ReachBellConfig(apiKey: key, apiUrl: url, timeout: timeout);
-    _ownedClient?.close();
-    _ownedClient = null;
-    final client = _testClient ?? (_ownedClient = http.Client());
+    // Requests already running on the previous client finish first.
+    _api?.closeWhenIdle();
+    final testClient = _testClient;
     _config = config;
-    _api = ApiClient(config, client);
+    _api = testClient != null
+        ? ApiClient(config, testClient)
+        : ApiClient(config, http.Client(), ownsClient: true);
   }
 
-  static Future<RegisterResult> register({String? externalId}) async {
+  /// Requests notification permission (skipped when already granted), reads
+  /// the FCM token and registers the device with `POST /subscribers`.
+  ///
+  /// Calls (register, reset, identify, tag, untag) run one at a time in call
+  /// order, so a launch-time register() and one from `onTokenRefresh` do not
+  /// race. When the token differs from the one the
+  /// last successful register() returned, that token is sent as
+  /// `previousToken` and ReachBell moves its tags and external id to the new
+  /// token. Pass [previousToken] yourself if you persist the token across
+  /// launches.
+  static Future<RegisterResult> register({
+    String? externalId,
+    String? previousToken,
+  }) =>
+      _serialized(() => _register(
+            externalId: externalId,
+            previousToken: previousToken,
+          ));
+
+  static Future<RegisterResult> _register({
+    String? externalId,
+    String? previousToken,
+  }) async {
     final api = _requireApi('register');
     final platform = _testPlatform ?? detectPushPlatform();
     final source = _testTokenSource ?? FirebaseTokenSource();
@@ -84,18 +119,31 @@ class ReachBell {
     }
 
     const tokenType = TokenType.fcm;
+    final device = _testDeviceInfo ?? DeviceInfo.detect(platform);
     final body = <String, Object?>{
       'token': deviceToken,
       'tokenType': tokenType.value,
       'platform': platform.value,
+      'os': device.os,
+      if (device.osVersion != null && device.osVersion!.isNotEmpty)
+        'osVersion': device.osVersion,
+      if (device.device != null) 'device': device.device,
     };
     final id = externalId?.trim();
     if (id != null && id.isNotEmpty) {
       body['externalId'] = id;
+    } else if (_clearExternalIdPending) {
+      // jsonEncode writes a null map value as `"externalId":null` (clear).
+      body['externalId'] = null;
+    }
+    final previous = (previousToken ?? _token)?.trim();
+    if (previous != null && previous.isNotEmpty && previous != deviceToken) {
+      body['previousToken'] = previous;
     }
 
     final response = await api.post(subscribersPath, body);
     _token = deviceToken;
+    _clearExternalIdPending = false;
 
     return RegisterResult(
       token: deviceToken,
@@ -105,7 +153,32 @@ class ReachBell {
     );
   }
 
-  static Future<void> identify(String externalId) async {
+  /// Call on logout. Unlinks the external id from the registered device
+  /// (`POST /subscribers/unidentify`, best effort: errors are ignored), then
+  /// forgets the stored token. Waits for a register() in progress first. The
+  /// device stays subscribed anonymously; call register() again for the next
+  /// user. The first register() after reset() without an externalId sends
+  /// `"externalId": null`, which also clears the link if unidentify failed.
+  static Future<void> reset() => _serialized(() async {
+        final token = _token;
+        final api = _api;
+        if (token != null && api != null) {
+          try {
+            await api.postAction(unidentifyPath, {'token': token});
+          } on ReachBellException {
+            // Best effort: local state is cleared either way.
+          }
+        }
+        _token = null;
+        _clearExternalIdPending = true;
+      });
+
+  /// Queued behind earlier register()/reset() calls, so `reset();
+  /// identify('u2')` without awaiting runs in that order.
+  static Future<void> identify(String externalId) =>
+      _serialized(() => _identify(externalId));
+
+  static Future<void> _identify(String externalId) async {
     final api = _requireApi('identify');
     final token = _requireToken('identify');
     final id = externalId.trim();
@@ -122,6 +195,10 @@ class ReachBell {
       _tagAction('untag', untagPath, tags);
 
   static Future<void> _tagAction(
+          String method, String path, List<String> tags) =>
+      _serialized(() => _sendTags(method, path, tags));
+
+  static Future<void> _sendTags(
       String method, String path, List<String> tags) async {
     final api = _requireApi(method);
     final token = _requireToken(method);
@@ -134,6 +211,12 @@ class ReachBell {
       throw ReachBellException('$method: at least one tag is required');
     }
     await api.postAction(path, {'token': token, 'tags': cleaned});
+  }
+
+  static Future<T> _serialized<T>(Future<T> Function() action) {
+    final result = _queue.then((_) => action());
+    _queue = result.then<void>((_) {}, onError: (Object _) {});
+    return result;
   }
 
   static ApiClient _requireApi(String method) {
@@ -171,21 +254,25 @@ class ReachBell {
     http.Client? httpClient,
     TokenSource? tokenSource,
     PushPlatform? platform,
+    DeviceInfo? deviceInfo,
   }) {
     _testClient = httpClient;
     _testTokenSource = tokenSource;
     _testPlatform = platform;
+    _testDeviceInfo = deviceInfo;
   }
 
   @visibleForTesting
   static void debugReset() {
-    _ownedClient?.close();
-    _ownedClient = null;
+    _api?.closeWhenIdle();
     _config = null;
     _api = null;
     _token = null;
+    _clearExternalIdPending = false;
+    _queue = Future<void>.value();
     _testClient = null;
     _testTokenSource = null;
     _testPlatform = null;
+    _testDeviceInfo = null;
   }
 }
