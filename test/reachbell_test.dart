@@ -7,6 +7,7 @@ import 'package:http/testing.dart';
 import 'package:reachbell/reachbell.dart';
 import 'package:reachbell/src/helpers/api_client.dart';
 import 'package:reachbell/src/types/config.dart';
+import 'package:reachbell/src/utils/device_info.dart';
 
 class FakeTokenSource implements TokenSource {
   FakeTokenSource({this.granted = true, this.token = 'fcm-token-1'});
@@ -81,14 +82,19 @@ void setUpSdk({
   TokenSource? tokenSource,
   PushPlatform platform = PushPlatform.android,
   String? apiUrl,
+  DeviceInfo? deviceInfo,
 }) {
   ReachBell.debugOverride(
     httpClient: client,
     tokenSource: tokenSource ?? FakeTokenSource(),
     platform: platform,
+    deviceInfo: deviceInfo ?? testDevice,
   );
   ReachBell.init(apiKey: 'rb_live_test', apiUrl: apiUrl);
 }
+
+const testDevice =
+    DeviceInfo(os: 'Android', osVersion: '14', device: 'mobile');
 
 Matcher throwsReachBell({int? statusCode, String? message}) {
   var matcher = isA<ReachBellException>();
@@ -147,8 +153,41 @@ void main() {
         'token': 'fcm-token-1',
         'tokenType': 'fcm',
         'platform': 'android',
+        'os': 'Android',
+        'osVersion': '14',
+        'device': 'mobile',
         'externalId': 'user_42',
       });
+    });
+
+    test('detects os from the push platform and omits a missing osVersion',
+        () async {
+      setUpSdk(
+        client: mockClient(calls, (_) => json({'_id': 's'})),
+        platform: PushPlatform.ios,
+        deviceInfo: const DeviceInfo(os: 'iOS', device: 'tablet'),
+      );
+
+      await ReachBell.register();
+
+      expect(calls.single.body['os'], 'iOS');
+      expect(calls.single.body.containsKey('osVersion'), isFalse);
+      expect(calls.single.body['device'], 'tablet');
+      expect(DeviceInfo.detect(PushPlatform.ios).os, 'iOS');
+      expect(DeviceInfo.detect(PushPlatform.android).os, 'Android');
+    });
+
+    test('parses operatingSystemVersion', () {
+      expect(
+          DeviceInfo.parseOsVersion(
+              PushPlatform.ios, 'Version 17.4 (Build 21E213)'),
+          '17.4');
+      expect(DeviceInfo.parseOsVersion(PushPlatform.android, '14'), '14');
+      expect(
+          DeviceInfo.parseOsVersion(
+              PushPlatform.android, 'Linux 5.10.157-android13 #1 SMP'),
+          isNull);
+      expect(DeviceInfo.parseOsVersion(PushPlatform.ios, null), isNull);
     });
 
     test('uses fcm tokenType and ios platform on iOS', () async {
@@ -369,6 +408,9 @@ void main() {
         'token': 'fcm-token-2',
         'tokenType': 'fcm',
         'platform': 'android',
+        'os': 'Android',
+        'osVersion': '14',
+        'device': 'mobile',
         'previousToken': 'fcm-token-1',
       });
       expect(ReachBell.token, 'fcm-token-2');
@@ -493,14 +535,117 @@ void main() {
     });
 
     test('next register after reset sends no previousToken', () async {
-      setUpSdk(client: mockClient(calls, (_) => json({'success': true})));
+      final source = FakeTokenSource();
+      setUpSdk(
+        client: mockClient(calls, (_) => json({'success': true})),
+        tokenSource: source,
+      );
       await ReachBell.register();
+      await ReachBell.reset();
+      // A rotated token: had reset() kept fcm-token-1, it would be sent as
+      // previousToken.
+      source.token = 'fcm-token-2';
+
+      await ReachBell.register(externalId: 'user_9');
+
+      expect(calls.last.body['token'], 'fcm-token-2');
+      expect(calls.last.body.containsKey('previousToken'), isFalse);
+      expect(calls.last.body['externalId'], 'user_9');
+    });
+
+    test('first register after reset sends externalId: null, once', () async {
+      setUpSdk(
+        client: mockClient(calls, (request) {
+          if (request.url.path == '/subscribers') return json({'_id': 's'});
+          // unidentify fails (offline): the null externalId repairs it.
+          return json({'message': 'boom'}, 500);
+        }),
+      );
+      await ReachBell.register(externalId: 'user_42');
+      await ReachBell.reset();
+
+      await ReachBell.register();
+
+      expect(calls[2].request.url.path, '/subscribers');
+      expect(calls[2].body.containsKey('externalId'), isTrue);
+      expect(calls[2].body['externalId'], isNull);
+      expect(calls[2].request.body, contains('"externalId":null'));
+
+      await ReachBell.register();
+      expect(calls[3].body.containsKey('externalId'), isFalse);
+    });
+
+    test('a failed register after reset keeps the null pending', () async {
+      var failNext = false;
+      setUpSdk(
+        client: mockClient(calls, (request) {
+          if (request.url.path != '/subscribers') {
+            return json({'success': true});
+          }
+          if (failNext) {
+            failNext = false;
+            return json({'message': 'boom'}, 500);
+          }
+          return json({'_id': 's'});
+        }),
+      );
+      await ReachBell.register(externalId: 'user_42');
+      await ReachBell.reset();
+      failNext = true;
+
+      await expectLater(ReachBell.register(), throwsReachBell(statusCode: 500));
+      await ReachBell.register();
+
+      expect(calls[2].body['externalId'], isNull);
+      expect(calls[3].body.containsKey('externalId'), isTrue);
+      expect(calls[3].body['externalId'], isNull);
+    });
+
+    test('an explicit externalId after reset is sent instead of null',
+        () async {
+      setUpSdk(client: mockClient(calls, (_) => json({'success': true})));
+      await ReachBell.register(externalId: 'user_42');
       await ReachBell.reset();
 
       await ReachBell.register(externalId: 'user_9');
 
-      expect(calls.last.body.containsKey('previousToken'), isFalse);
       expect(calls.last.body['externalId'], 'user_9');
+    });
+
+    test('identify, tag and untag queue behind reset and register', () async {
+      setUpSdk(
+        client: mockClient(calls, (request) {
+          if (request.url.path == '/subscribers') return json({'_id': 's'});
+          return json({'success': true, 'updated': true});
+        }),
+      );
+      await ReachBell.register(externalId: 'user_1');
+
+      // Not awaited: each call must still run in call order.
+      final resetting = ReachBell.reset();
+      // Runs after reset(), so the token is gone. Listened to straight away
+      // so the error is not reported as unhandled.
+      final identifyBeforeRegister = expectLater(
+          ReachBell.identify('user_2'), throwsReachBell(message: 'register()'));
+      final registering = ReachBell.register();
+      final identifying = ReachBell.identify('user_2');
+      final tagging = ReachBell.tag(['pro']);
+
+      await resetting;
+      await identifyBeforeRegister;
+      await registering;
+      await identifying;
+      await tagging;
+
+      expect(calls.map((c) => c.request.url.path).toList(), [
+        '/subscribers',
+        '/subscribers/unidentify',
+        '/subscribers',
+        '/subscribers/identify',
+        '/subscribers/tag',
+      ]);
+      expect(calls[2].body['externalId'], isNull);
+      expect(calls[3].body, {'token': 'fcm-token-1', 'externalId': 'user_2'});
     });
   });
 

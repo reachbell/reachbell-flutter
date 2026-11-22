@@ -87,13 +87,14 @@ void listenForTokenRefresh() {
 }
 ```
 
-Because the token lives in memory, a token that rotated while the app was not running is registered as a new subscriber on the next launch. If you persist `ReachBell.token` yourself, pass it back as `register(previousToken: savedToken)` to carry tags and the external id over in that case too.
+Because the token lives in memory, a token that rotated while the app was not running is registered as a new subscriber on the next launch. If you persist `ReachBell.token` yourself, pass it back as `register(previousToken: savedToken)` to carry tags and the external id over in that case too. Delete that saved token when you call `ReachBell.reset()`: passed back after a logout, it would carry the old user's tags and external id over to the next registration.
 
-When the user logs out, call `ReachBell.reset()` so the device is no longer linked to their user id. The device stays subscribed anonymously; call `register(externalId: ...)` or `identify(...)` for the next user.
+When the user logs out, call `ReachBell.reset()` so the device is no longer linked to their user id. The device stays subscribed anonymously; call `register(externalId: ...)` or `identify(...)` for the next user. The first `register()` after `reset()` without an `externalId` sends `"externalId": null`, so the server drops the old user even if the unidentify call failed offline. All SDK calls run one at a time in call order, so `reset()` followed by `register()` or `identify()` without `await` is safe.
 
 ```dart
 Future<void> logout() async {
   await ReachBell.reset();
+  // If you persist ReachBell.token, delete the saved copy here.
   // ...your own sign-out
 }
 ```
