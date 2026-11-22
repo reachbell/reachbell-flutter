@@ -32,29 +32,65 @@ class DeviceInfo {
 
   /// Extracts a dotted version from `Platform.operatingSystemVersion`.
   ///
-  /// iOS reports `Version 17.4 (Build 21E213)`. On Android the value is not a
-  /// documented Android release (it can be a kernel or build string), so it is
-  /// only used when it is a plain version number.
+  /// iOS reports `Version 17.4 (Build 21E213)`. On Android the value is a
+  /// kernel or build string, not the Android release, and reading the release
+  /// would need a plugin, so Android gets null (the field is omitted).
   @visibleForTesting
   static String? parseOsVersion(PushPlatform platform, String? raw) {
+    if (platform != PushPlatform.ios) return null;
     final value = raw?.trim();
     if (value == null || value.isEmpty) return null;
-    if (platform == PushPlatform.ios) {
-      return RegExp(r'\d+(?:\.\d+)*').firstMatch(value)?.group(0);
-    }
-    return RegExp(r'^\d+(?:\.\d+)*$').hasMatch(value) ? value : null;
+    return RegExp(r'\d+(?:\.\d+)*').firstMatch(value)?.group(0);
   }
 
-  /// `tablet` when the shortest side of the screen is at least 600 logical
-  /// pixels (the Android sw600dp breakpoint), otherwise `mobile`.
+  /// `tablet` when the shortest side of the physical display is at least 600
+  /// logical pixels (the Android sw600dp breakpoint), otherwise `mobile`.
+  ///
+  /// Uses the display rather than the window, so split screen, freeform
+  /// windows and iPad multitasking do not turn a tablet into `mobile`. Falls
+  /// back to the window when the engine reports no display size.
   static String _deviceType() {
     try {
       final view = ui.PlatformDispatcher.instance.implicitView;
-      if (view == null || view.devicePixelRatio <= 0) return 'mobile';
-      final size = view.physicalSize / view.devicePixelRatio;
-      return size.shortestSide >= 600 ? 'tablet' : 'mobile';
+      if (view == null) return 'mobile';
+      ui.Size? displaySize;
+      double displayRatio = 0;
+      try {
+        final display = view.display;
+        displaySize = display.size;
+        displayRatio = display.devicePixelRatio;
+      } catch (_) {
+        displaySize = null;
+      }
+      return deviceTypeFor(
+        displaySize: displaySize,
+        displayPixelRatio: displayRatio,
+        windowSize: view.physicalSize,
+        windowPixelRatio: view.devicePixelRatio,
+      );
     } catch (_) {
       return 'mobile';
     }
+  }
+
+  /// Classifies physical pixel sizes: the display when it has a size and a
+  /// pixel ratio, otherwise the window.
+  @visibleForTesting
+  static String deviceTypeFor({
+    ui.Size? displaySize,
+    double displayPixelRatio = 0,
+    ui.Size? windowSize,
+    double windowPixelRatio = 0,
+  }) {
+    ui.Size? logical;
+    if (displaySize != null && !displaySize.isEmpty && displayPixelRatio > 0) {
+      logical = displaySize / displayPixelRatio;
+    } else if (windowSize != null &&
+        !windowSize.isEmpty &&
+        windowPixelRatio > 0) {
+      logical = windowSize / windowPixelRatio;
+    }
+    if (logical == null) return 'mobile';
+    return logical.shortestSide >= 600 ? 'tablet' : 'mobile';
   }
 }

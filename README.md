@@ -59,7 +59,7 @@ try {
 
 | Member | Description |
 | --- | --- |
-| `ReachBell.init({required String apiKey, String? apiUrl, Duration timeout})` | Configure the SDK once. `apiUrl` defaults to `https://api.reachbell.com`, `timeout` to 15 seconds. |
+| `ReachBell.init({required String apiKey, String? apiUrl, Duration timeout, Duration tokenTimeout})` | Configure the SDK once. `apiUrl` defaults to `https://api.reachbell.com`, `timeout` (per API request) to 15 seconds. `tokenTimeout` (default 30 seconds) bounds the notification permission request and the FCM token read in `register()`. |
 | `ReachBell.register({String? externalId, String? previousToken})` | Requests notification permission (skipped when already granted), reads the FCM token and registers the device. Calls run one at a time. When the token differs from the last registered one, `previousToken` defaults to that token. Returns a `RegisterResult`. |
 | `ReachBell.identify(String externalId)` | Links the registered device to your user id. |
 | `ReachBell.tag(List<String> tags)` | Adds tags to the registered subscriber. |
@@ -89,7 +89,7 @@ void listenForTokenRefresh() {
 
 Because the token lives in memory, a token that rotated while the app was not running is registered as a new subscriber on the next launch. If you persist `ReachBell.token` yourself, pass it back as `register(previousToken: savedToken)` to carry tags and the external id over in that case too. Delete that saved token when you call `ReachBell.reset()`: passed back after a logout, it would carry the old user's tags and external id over to the next registration.
 
-When the user logs out, call `ReachBell.reset()` so the device is no longer linked to their user id. The device stays subscribed anonymously; call `register(externalId: ...)` or `identify(...)` for the next user. The first `register()` after `reset()` without an `externalId` sends `"externalId": null`, so the server drops the old user even if the unidentify call failed offline. All SDK calls run one at a time in call order, so `reset()` followed by `register()` or `identify()` without `await` is safe.
+When the user logs out, call `ReachBell.reset()` so the device is no longer linked to their user id. The device stays subscribed anonymously; call `register(externalId: ...)`, or `register()` followed by `identify(...)`, for the next user. The first `register()` after `reset()` without an `externalId` sends `"externalId": null`, so the server drops the old user even if the unidentify call failed offline. All SDK calls run one at a time in call order, so `reset()` followed by `register()` without `await` is safe. `reset()` forgets the token, so `identify()`, `tag()` and `untag()` throw `ReachBellException` until a `register()` after the reset succeeds. Queue them after that `register()` (calling them without `await` right after it is fine, since they wait for it), or pass the id as `register(externalId: ...)`.
 
 ```dart
 Future<void> logout() async {
@@ -104,7 +104,7 @@ Future<void> logout() async {
 Every method except `reset()` throws `ReachBellException` with `message`, `statusCode` and `body`:
 
 - `init()` not called, or `identify()` / `tag()` / `untag()` called before a successful `register()`.
-- Notification permission denied, or no push token available.
+- Notification permission denied, or no push token available. Also thrown when the permission request or the FCM token read takes longer than `tokenTimeout`; later calls are not held up by it.
 - A non-2xx API response, for example `403` when the plan's subscriber limit is reached.
 - A 2xx response with `success: false`, for example `subscriber_not_found`.
 - A network failure or timeout, where `statusCode` is `null`.

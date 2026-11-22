@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:http/http.dart' as http;
 import 'package:meta/meta.dart';
 
@@ -43,6 +45,7 @@ class ReachBell {
     required String apiKey,
     String? apiUrl,
     Duration timeout = defaultTimeout,
+    Duration tokenTimeout = defaultTokenTimeout,
   }) {
     final key = apiKey.trim();
     if (key.isEmpty) {
@@ -52,11 +55,16 @@ class ReachBell {
       throw const ReachBellException(
           'ReachBell.init: timeout must be greater than zero');
     }
+    if (tokenTimeout <= Duration.zero) {
+      throw const ReachBellException(
+          'ReachBell.init: tokenTimeout must be greater than zero');
+    }
     final url = normalizeApiUrl(apiUrl ?? defaultApiUrl);
     if (Uri.tryParse(url)?.hasScheme != true) {
       throw ReachBellException('ReachBell.init: invalid apiUrl "$apiUrl"');
     }
-    final config = ReachBellConfig(apiKey: key, apiUrl: url, timeout: timeout);
+    final config = ReachBellConfig(
+        apiKey: key, apiUrl: url, timeout: timeout, tokenTimeout: tokenTimeout);
     // Requests already running on the previous client finish first.
     _api?.closeWhenIdle();
     final testClient = _testClient;
@@ -68,6 +76,9 @@ class ReachBell {
 
   /// Requests notification permission (skipped when already granted), reads
   /// the FCM token and registers the device with `POST /subscribers`.
+  /// The permission request and the token read each give up after
+  /// `tokenTimeout` (see [init]) with a [ReachBellException], and the queue
+  /// moves on.
   ///
   /// Calls (register, reset, identify, tag, untag) run one at a time in call
   /// order, so a launch-time register() and one from `onTokenRefresh` do not
@@ -90,14 +101,19 @@ class ReachBell {
     String? previousToken,
   }) async {
     final api = _requireApi('register');
+    final tokenTimeout = _config?.tokenTimeout ?? defaultTokenTimeout;
     final platform = _testPlatform ?? detectPushPlatform();
     final source = _testTokenSource ?? FirebaseTokenSource();
 
     final bool granted;
     try {
-      granted = await source.requestPermission();
+      // A prompt or plugin call that never completes must not block the queue.
+      granted = await source.requestPermission().timeout(tokenTimeout);
     } on ReachBellException {
       rethrow;
+    } on TimeoutException {
+      throw ReachBellException('Notification permission request timed out '
+          'after ${tokenTimeout.inMilliseconds} ms');
     } catch (error) {
       throw ReachBellException(
           'Failed to request notification permission: $error');
@@ -108,9 +124,12 @@ class ReachBell {
 
     final String? deviceToken;
     try {
-      deviceToken = await source.getToken(platform);
+      deviceToken = await source.getToken(platform).timeout(tokenTimeout);
     } on ReachBellException {
       rethrow;
+    } on TimeoutException {
+      throw ReachBellException(
+          'No push token within ${tokenTimeout.inMilliseconds} ms');
     } catch (error) {
       throw ReachBellException('Failed to obtain a push token: $error');
     }
@@ -173,8 +192,10 @@ class ReachBell {
         _clearExternalIdPending = true;
       });
 
-  /// Queued behind earlier register()/reset() calls, so `reset();
-  /// identify('u2')` without awaiting runs in that order.
+  /// Queued behind earlier register()/reset() calls, so `reset(); register();
+  /// identify('u2')` without awaiting runs in that order. Throws when no
+  /// token is registered, which includes right after reset() until a
+  /// register() succeeds.
   static Future<void> identify(String externalId) =>
       _serialized(() => _identify(externalId));
 

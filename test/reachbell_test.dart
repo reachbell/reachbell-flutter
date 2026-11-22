@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:ui' show Size;
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:http/http.dart' as http;
@@ -20,9 +21,17 @@ class FakeTokenSource implements TokenSource {
   /// When set, requestPermission() waits for it.
   Completer<void>? gate;
 
+  /// The next this-many requestPermission() / getToken() calls never complete.
+  int hangingPermissionCalls = 0;
+  int hangingTokenCalls = 0;
+
   @override
   Future<bool> requestPermission() async {
     permissionRequests++;
+    if (hangingPermissionCalls > 0) {
+      hangingPermissionCalls--;
+      await Completer<void>().future;
+    }
     await gate?.future;
     return granted;
   }
@@ -30,6 +39,10 @@ class FakeTokenSource implements TokenSource {
   @override
   Future<String?> getToken(PushPlatform platform) async {
     requestedFor = platform;
+    if (hangingTokenCalls > 0) {
+      hangingTokenCalls--;
+      await Completer<void>().future;
+    }
     return token;
   }
 }
@@ -177,12 +190,42 @@ void main() {
       expect(DeviceInfo.detect(PushPlatform.android).os, 'Android');
     });
 
+    test('classifies tablets by the physical display, not the window', () {
+      // A 2560x1600 @2x tablet in split screen: the window is 1280x1600 px.
+      expect(
+          DeviceInfo.deviceTypeFor(
+            displaySize: const Size(2560, 1600),
+            displayPixelRatio: 2,
+            windowSize: const Size(1000, 1600),
+            windowPixelRatio: 2,
+          ),
+          'tablet');
+      expect(
+          DeviceInfo.deviceTypeFor(
+            displaySize: const Size(1080, 2400),
+            displayPixelRatio: 2.75,
+            windowSize: const Size(1080, 2400),
+            windowPixelRatio: 2.75,
+          ),
+          'mobile');
+      // No display size reported: fall back to the window.
+      expect(
+          DeviceInfo.deviceTypeFor(
+            displaySize: Size.zero,
+            windowSize: const Size(2048, 2732),
+            windowPixelRatio: 2,
+          ),
+          'tablet');
+      expect(DeviceInfo.deviceTypeFor(), 'mobile');
+    });
+
     test('parses operatingSystemVersion', () {
       expect(
           DeviceInfo.parseOsVersion(
               PushPlatform.ios, 'Version 17.4 (Build 21E213)'),
           '17.4');
-      expect(DeviceInfo.parseOsVersion(PushPlatform.android, '14'), '14');
+      // Android's operatingSystemVersion is not the release: always omitted.
+      expect(DeviceInfo.parseOsVersion(PushPlatform.android, '14'), isNull);
       expect(
           DeviceInfo.parseOsVersion(
               PushPlatform.android, 'Linux 5.10.157-android13 #1 SMP'),
@@ -468,6 +511,49 @@ void main() {
       await ReachBell.register();
 
       expect(calls, hasLength(1));
+    });
+  });
+
+  group('token timeout', () {
+    test('a permission request that never completes times out', () async {
+      final source = FakeTokenSource()..hangingPermissionCalls = 1;
+      setUpSdk(
+        client: mockClient(calls, (_) => json({'_id': 's'})),
+        tokenSource: source,
+      );
+      ReachBell.init(
+          apiKey: 'rb_live_test',
+          tokenTimeout: const Duration(milliseconds: 20));
+
+      final first = ReachBell.register(externalId: 'u1');
+      final second = ReachBell.register(externalId: 'u2');
+      await expectLater(first, throwsReachBell(message: 'timed out'));
+      await second;
+
+      expect(calls, hasLength(1));
+      expect(calls.single.body['externalId'], 'u2');
+    });
+
+    test('a token read that never completes times out', () async {
+      final source = FakeTokenSource()..hangingTokenCalls = 1;
+      setUpSdk(
+        client: mockClient(calls, (_) => json({'_id': 's'})),
+        tokenSource: source,
+      );
+      ReachBell.init(
+          apiKey: 'rb_live_test',
+          tokenTimeout: const Duration(milliseconds: 20));
+
+      await expectLater(
+          ReachBell.register(), throwsReachBell(message: 'No push token'));
+      await ReachBell.register();
+      expect(calls, hasLength(1));
+    });
+
+    test('rejects a non-positive tokenTimeout', () {
+      expect(
+          () => ReachBell.init(apiKey: 'k', tokenTimeout: Duration.zero),
+          throwsReachBell(message: 'tokenTimeout'));
     });
   });
 
