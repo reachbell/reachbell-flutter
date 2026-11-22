@@ -17,8 +17,10 @@ class ReachBell {
 
   static ReachBellConfig? _config;
   static ApiClient? _api;
-  static http.Client? _ownedClient;
   static String? _token;
+
+  /// Tail of the queue that runs register() and reset() one at a time.
+  static Future<void> _queue = Future<void>.value();
 
   static http.Client? _testClient;
   static TokenSource? _testTokenSource;
@@ -46,14 +48,37 @@ class ReachBell {
       throw ReachBellException('ReachBell.init: invalid apiUrl "$apiUrl"');
     }
     final config = ReachBellConfig(apiKey: key, apiUrl: url, timeout: timeout);
-    _ownedClient?.close();
-    _ownedClient = null;
-    final client = _testClient ?? (_ownedClient = http.Client());
+    // Requests already running on the previous client finish first.
+    _api?.closeWhenIdle();
+    final testClient = _testClient;
     _config = config;
-    _api = ApiClient(config, client);
+    _api = testClient != null
+        ? ApiClient(config, testClient)
+        : ApiClient(config, http.Client(), ownsClient: true);
   }
 
-  static Future<RegisterResult> register({String? externalId}) async {
+  /// Requests notification permission (skipped when already granted), reads
+  /// the FCM token and registers the device with `POST /subscribers`.
+  ///
+  /// Calls run one at a time, so a launch-time register() and one from
+  /// `onTokenRefresh` do not race. When the token differs from the one the
+  /// last successful register() returned, that token is sent as
+  /// `previousToken` and ReachBell moves its tags and external id to the new
+  /// token. Pass [previousToken] yourself if you persist the token across
+  /// launches.
+  static Future<RegisterResult> register({
+    String? externalId,
+    String? previousToken,
+  }) =>
+      _serialized(() => _register(
+            externalId: externalId,
+            previousToken: previousToken,
+          ));
+
+  static Future<RegisterResult> _register({
+    String? externalId,
+    String? previousToken,
+  }) async {
     final api = _requireApi('register');
     final platform = _testPlatform ?? detectPushPlatform();
     final source = _testTokenSource ?? FirebaseTokenSource();
@@ -93,6 +118,10 @@ class ReachBell {
     if (id != null && id.isNotEmpty) {
       body['externalId'] = id;
     }
+    final previous = (previousToken ?? _token)?.trim();
+    if (previous != null && previous.isNotEmpty && previous != deviceToken) {
+      body['previousToken'] = previous;
+    }
 
     final response = await api.post(subscribersPath, body);
     _token = deviceToken;
@@ -104,6 +133,24 @@ class ReachBell {
       subscriberId: _subscriberId(response.body),
     );
   }
+
+  /// Call on logout. Unlinks the external id from the registered device
+  /// (`POST /subscribers/unidentify`, best effort: errors are ignored), then
+  /// forgets the stored token. Waits for a register() in progress first. The
+  /// device stays subscribed anonymously; call register() again for the next
+  /// user.
+  static Future<void> reset() => _serialized(() async {
+        final token = _token;
+        final api = _api;
+        if (token != null && api != null) {
+          try {
+            await api.postAction(unidentifyPath, {'token': token});
+          } on ReachBellException {
+            // Best effort: local state is cleared either way.
+          }
+        }
+        _token = null;
+      });
 
   static Future<void> identify(String externalId) async {
     final api = _requireApi('identify');
@@ -134,6 +181,12 @@ class ReachBell {
       throw ReachBellException('$method: at least one tag is required');
     }
     await api.postAction(path, {'token': token, 'tags': cleaned});
+  }
+
+  static Future<T> _serialized<T>(Future<T> Function() action) {
+    final result = _queue.then((_) => action());
+    _queue = result.then<void>((_) {}, onError: (Object _) {});
+    return result;
   }
 
   static ApiClient _requireApi(String method) {
@@ -179,11 +232,11 @@ class ReachBell {
 
   @visibleForTesting
   static void debugReset() {
-    _ownedClient?.close();
-    _ownedClient = null;
+    _api?.closeWhenIdle();
     _config = null;
     _api = null;
     _token = null;
+    _queue = Future<void>.value();
     _testClient = null;
     _testTokenSource = null;
     _testPlatform = null;

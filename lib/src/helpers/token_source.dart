@@ -16,20 +16,25 @@ class FirebaseTokenSource implements TokenSource {
 
   FirebaseMessaging get _instance => _messaging ?? FirebaseMessaging.instance;
 
+  /// Returns true straight away when permission is already granted, so
+  /// repeated `register()` calls do not prompt again.
   @override
   Future<bool> requestPermission() async {
+    final current = await _instance.getNotificationSettings();
+    if (_isGranted(current.authorizationStatus)) return true;
     final settings = await _instance.requestPermission();
-    final status = settings.authorizationStatus;
-    return status == AuthorizationStatus.authorized ||
-        status == AuthorizationStatus.provisional;
+    return _isGranted(settings.authorizationStatus);
   }
+
+  static bool _isGranted(AuthorizationStatus status) =>
+      status == AuthorizationStatus.authorized ||
+      status == AuthorizationStatus.provisional;
 
   @override
   Future<String?> getToken(PushPlatform platform) async {
     if (platform == PushPlatform.ios) {
       await _waitForApnsToken();
     }
-    // ignore: deprecated_member_use
     return _instance.getToken();
   }
 

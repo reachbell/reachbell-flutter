@@ -1,25 +1,55 @@
+import 'dart:async';
 import 'dart:convert';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
 import 'package:reachbell/reachbell.dart';
+import 'package:reachbell/src/helpers/api_client.dart';
+import 'package:reachbell/src/types/config.dart';
 
 class FakeTokenSource implements TokenSource {
   FakeTokenSource({this.granted = true, this.token = 'fcm-token-1'});
 
   final bool granted;
-  final String? token;
+  String? token;
   PushPlatform? requestedFor;
+  int permissionRequests = 0;
+
+  /// When set, requestPermission() waits for it.
+  Completer<void>? gate;
 
   @override
-  Future<bool> requestPermission() async => granted;
+  Future<bool> requestPermission() async {
+    permissionRequests++;
+    await gate?.future;
+    return granted;
+  }
 
   @override
   Future<String?> getToken(PushPlatform platform) async {
     requestedFor = platform;
     return token;
   }
+}
+
+/// Fails like a real http.Client once closed.
+class ClosableClient extends http.BaseClient {
+  ClosableClient(this._inner);
+
+  final http.Client _inner;
+  bool closed = false;
+
+  @override
+  Future<http.StreamedResponse> send(http.BaseRequest request) async {
+    if (closed) throw http.ClientException('Client is already closed');
+    final response = await _inner.send(request);
+    if (closed) throw http.ClientException('Client is already closed');
+    return response;
+  }
+
+  @override
+  void close() => closed = true;
 }
 
 class Recorded {
@@ -318,6 +348,222 @@ void main() {
       await expectLater(ReachBell.identify(' '), throwsReachBell());
       await expectLater(ReachBell.tag(['', ' ']), throwsReachBell());
       expect(calls, isEmpty);
+    });
+  });
+
+  group('token rotation', () {
+    test('sends the last registered token as previousToken', () async {
+      final source = FakeTokenSource();
+      setUpSdk(
+        client: mockClient(calls, (_) => json({'_id': 's'})),
+        tokenSource: source,
+      );
+
+      await ReachBell.register(externalId: 'user_42');
+      source.token = 'fcm-token-2';
+      await ReachBell.register();
+
+      expect(calls, hasLength(2));
+      expect(calls[0].body.containsKey('previousToken'), isFalse);
+      expect(calls[1].body, {
+        'token': 'fcm-token-2',
+        'tokenType': 'fcm',
+        'platform': 'android',
+        'previousToken': 'fcm-token-1',
+      });
+      expect(ReachBell.token, 'fcm-token-2');
+    });
+
+    test('omits previousToken when the token did not change', () async {
+      setUpSdk(client: mockClient(calls, (_) => json({'_id': 's'})));
+
+      await ReachBell.register();
+      await ReachBell.register();
+
+      expect(calls[1].body.containsKey('previousToken'), isFalse);
+    });
+
+    test('accepts an explicit previousToken', () async {
+      setUpSdk(client: mockClient(calls, (_) => json({'_id': 's'})));
+
+      await ReachBell.register(previousToken: 'persisted-token');
+
+      expect(calls.single.body['previousToken'], 'persisted-token');
+    });
+  });
+
+  group('serialised register', () {
+    test('concurrent calls run one at a time', () async {
+      final source = FakeTokenSource()..gate = Completer<void>();
+      setUpSdk(
+        client: mockClient(calls, (_) => json({'_id': 's'})),
+        tokenSource: source,
+      );
+
+      final first = ReachBell.register();
+      final second = ReachBell.register();
+      await pumpEventQueue();
+
+      expect(source.permissionRequests, 1);
+      expect(calls, isEmpty);
+
+      source.gate!.complete();
+      await Future.wait([first, second]);
+
+      expect(source.permissionRequests, 2);
+      expect(calls, hasLength(2));
+    });
+
+    test('a failed register does not block the next one', () async {
+      final source = FakeTokenSource(token: null);
+      setUpSdk(
+        client: mockClient(calls, (_) => json({'_id': 's'})),
+        tokenSource: source,
+      );
+
+      await expectLater(ReachBell.register(), throwsReachBell());
+      source.token = 'fcm-token-1';
+      await ReachBell.register();
+
+      expect(calls, hasLength(1));
+    });
+  });
+
+  group('reset', () {
+    test('unidentifies the stored token, then forgets it', () async {
+      setUpSdk(
+        client: mockClient(calls, (request) {
+          if (request.url.path == '/subscribers') return json({'_id': 's'});
+          return json({'success': true});
+        }),
+      );
+      await ReachBell.register(externalId: 'user_42');
+
+      await ReachBell.reset();
+
+      expect(calls[1].request.url.path, '/subscribers/unidentify');
+      expect(calls[1].body, {'token': 'fcm-token-1'});
+      expect(ReachBell.token, isNull);
+      await expectLater(ReachBell.identify('user_42'),
+          throwsReachBell(message: 'register()'));
+    });
+
+    test('clears local state even when unidentify fails', () async {
+      setUpSdk(
+        client: mockClient(calls, (request) {
+          if (request.url.path == '/subscribers') return json({'_id': 's'});
+          return json({'message': 'boom'}, 500);
+        }),
+      );
+      await ReachBell.register();
+
+      await ReachBell.reset();
+
+      expect(calls, hasLength(2));
+      expect(ReachBell.token, isNull);
+    });
+
+    test('sends nothing without a registration', () async {
+      setUpSdk(client: mockClient(calls, (_) => json({'success': true})));
+
+      await ReachBell.reset();
+
+      expect(calls, isEmpty);
+    });
+
+    test('waits for a register in progress', () async {
+      final source = FakeTokenSource()..gate = Completer<void>();
+      setUpSdk(
+        client: mockClient(calls, (request) {
+          if (request.url.path == '/subscribers') return json({'_id': 's'});
+          return json({'success': true});
+        }),
+        tokenSource: source,
+      );
+
+      final registering = ReachBell.register(externalId: 'user_42');
+      final resetting = ReachBell.reset();
+      source.gate!.complete();
+      await registering;
+      await resetting;
+
+      expect(calls.map((c) => c.request.url.path).toList(),
+          ['/subscribers', '/subscribers/unidentify']);
+      expect(ReachBell.token, isNull);
+    });
+
+    test('next register after reset sends no previousToken', () async {
+      setUpSdk(client: mockClient(calls, (_) => json({'success': true})));
+      await ReachBell.register();
+      await ReachBell.reset();
+
+      await ReachBell.register(externalId: 'user_9');
+
+      expect(calls.last.body.containsKey('previousToken'), isFalse);
+      expect(calls.last.body['externalId'], 'user_9');
+    });
+  });
+
+  group('ApiClient', () {
+    const config = ReachBellConfig(
+      apiKey: 'rb_live_test',
+      apiUrl: 'https://api.example.test',
+      timeout: Duration(seconds: 5),
+    );
+
+    test('closeWhenIdle waits for in-flight requests', () async {
+      final release = Completer<void>();
+      final client = ClosableClient(MockClient((_) async {
+        await release.future;
+        return json({'ok': true});
+      }));
+      final api = ApiClient(config, client, ownsClient: true);
+
+      final pending = api.post('/subscribers', {});
+      await pumpEventQueue();
+      api.closeWhenIdle();
+      expect(client.closed, isFalse);
+
+      release.complete();
+      final response = await pending;
+
+      expect(response.statusCode, 200);
+      expect(client.closed, isTrue);
+    });
+
+    test('does not close a client it does not own', () async {
+      final client = ClosableClient(MockClient((_) async => json({})));
+      ApiClient(config, client).closeWhenIdle();
+
+      expect(client.closed, isFalse);
+    });
+
+    test('wraps non-Exception errors as ReachBellException', () async {
+      final api = ApiClient(
+          config, MockClient((_) async => throw ArgumentError('bad header')));
+
+      await expectLater(
+        api.post('/subscribers', {}),
+        throwsA(isA<ReachBellException>()
+            .having((e) => e.message, 'message', contains('bad header'))),
+      );
+    });
+
+    test('joins NestJS array messages', () async {
+      final api = ApiClient(
+        config,
+        MockClient((_) async => json({
+              'statusCode': 400,
+              'message': ['token must be a string', 'tags must be an array'],
+              'error': 'Bad Request',
+            }, 400)),
+      );
+
+      await expectLater(
+        api.post('/subscribers', {}),
+        throwsA(isA<ReachBellException>().having((e) => e.message, 'message',
+            'token must be a string; tags must be an array')),
+      );
     });
   });
 }
